@@ -1,0 +1,26 @@
+#!/usr/bin/env python3.13
+"""Restore a pg_dump -Fc file into an (empty) app database in the shared container.
+
+    bin/import-dump <database> <file.dump>
+
+Creates the database and roles first if needed. Objects end up owned by <db>_owner and the
+writer/reader grants are re-applied, so the app works as soon as it connects.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import platform_lib as lib  # noqa: E402
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("database")
+    parser.add_argument("dump", type=Path)
+    args = parser.parse_args()
+    lib.import_dump(args.database, args.dump)
+
+
+lib.main_guard(main)

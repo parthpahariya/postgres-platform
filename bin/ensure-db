@@ -1,0 +1,36 @@
+#!/usr/bin/env python3.13
+"""Make sure the shared PostgreSQL container and one app's database exist.
+
+    bin/ensure-db <database> [--init-sql FILE]
+
+Idempotent: starts the container only if it is not running, creates the database and its
+<db>_owner / <db>_writer / <db>_reader roles only if missing, keeps existing passwords, and
+re-applies grants. Writes credentials/<db>.env (writer + reader URLs, for the app at runtime)
+and credentials/<db>.migrate.env (owner URL, for migrations).
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import platform_lib as lib  # noqa: E402
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("database", nargs="?", help="app database, e.g. rental_review")
+    parser.add_argument("--init-sql", type=Path, help="SQL run as the owner when first created")
+    parser.add_argument("--server-only", action="store_true", help="only start the container")
+    args = parser.parse_args()
+    if args.server_only:
+        with lib.locked():
+            lib.ensure_server(lib.docker())
+        lib.say("shared container is running")
+        return
+    if not args.database:
+        parser.error("database is required (or pass --server-only)")
+    lib.ensure_database(args.database, args.init_sql)
+
+
+lib.main_guard(main)

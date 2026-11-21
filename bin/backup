@@ -1,0 +1,26 @@
+#!/usr/bin/env python3.13
+"""Dump every app database to ~/postgres-backups/<db>/<time>.dump and prune old dumps.
+
+    bin/backup [--target DIR] [--keep-days 14]
+
+Run daily from cron on the VM, e.g.:
+    17 3 * * * $HOME/postgres-platform/bin/backup >> $HOME/postgres-backups/backup.log 2>&1
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import platform_lib as lib  # noqa: E402
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--target", type=Path, default=Path.home() / "postgres-backups")
+    parser.add_argument("--keep-days", type=int, default=14)
+    args = parser.parse_args()
+    lib.backup(args.target, args.keep_days)
+
+
+lib.main_guard(main)
