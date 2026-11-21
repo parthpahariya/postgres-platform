@@ -1,0 +1,359 @@
+"""Shared PostgreSQL helpers used by bin/ensure-db, bin/import-dump, bin/backup and bin/selftest.
+
+Requires Python 3.13 (the VM's Debian 13 python3; `brew install python@3.13` on a Mac).
+Standard library only. Every SQL statement that
+contains a password goes to psql on stdin, never on a command line, so passwords never show
+in process lists or shell history.
+"""
+
+import contextlib
+import fcntl
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+if sys.version_info < (3, 13):
+    sys.exit(f"postgres-platform needs Python 3.13+, not {sys.version.split()[0]}: run python3.13")
+
+ROOT = Path(__file__).resolve().parent.parent
+CONTAINER = "shared-postgres"
+ADMIN = "platform_admin"
+CREDENTIALS = ROOT / "credentials"
+ENV_FILE = ROOT / ".env"
+LOCK_FILE = Path.home() / ".postgres-platform.lock"
+NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
+ROLES = ("owner", "writer", "reader")
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"postgres-platform: {message}")
+
+
+def say(message: str) -> None:
+    print(f"postgres-platform: {message}", flush=True)
+
+
+def check_name(database: str) -> str:
+    if not NAME.match(database):
+        fail(f"invalid database name {database!r}: use lower-case letters, digits and _")
+    return database
+
+
+def role(database: str, kind: str) -> str:
+    return f"{database}_{kind}"
+
+
+# ---------------------------------------------------------------- docker
+
+
+def docker() -> list[str]:
+    """Docker command: $DOCKER if set, else docker, else passwordless sudo docker (VM)."""
+    if os.environ.get("DOCKER"):
+        return shlex.split(os.environ["DOCKER"])
+    for candidate in (["docker"], ["sudo", "-n", "docker"]):
+        try:
+            subprocess.run(candidate + ["info"], check=True, capture_output=True)
+            return candidate
+        except (OSError, subprocess.CalledProcessError):
+            continue
+    fail("cannot reach Docker (tried docker and sudo -n docker)")
+    return []
+
+
+def run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(args, check=True, text=True, **kwargs)
+
+
+@contextlib.contextmanager
+def locked():
+    """Serialise platform changes, e.g. two apps deploying at the same time."""
+    LOCK_FILE.touch(exist_ok=True)
+    with LOCK_FILE.open("w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+# ---------------------------------------------------------------- secrets
+
+
+def read_env(path: Path) -> dict[str, str]:
+    values = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+    return values
+
+
+def write_private(path: Path, lines: list[str]) -> None:
+    """Atomically write a file only the owner can read."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        stream.write("\n".join(lines) + "\n")
+    os.replace(temporary, path)
+
+
+def password() -> str:
+    # Hex only: safe inside SQL literals and URLs without escaping.
+    return secrets.token_hex(24)
+
+
+def admin_env() -> dict[str, str]:
+    """The superuser password lives only in this machine's .env; created on first use."""
+    values = read_env(ENV_FILE)
+    if not values.get("POSTGRES_ADMIN_PASSWORD"):
+        values["POSTGRES_ADMIN_PASSWORD"] = password()
+        write_private(
+            ENV_FILE,
+            ["# Created by bin/ensure-db. Superuser password; keep private."]
+            + [f"{k}={v}" for k, v in values.items()],
+        )
+        say("created .env with a new superuser password")
+    return values
+
+
+def app_passwords(database: str) -> dict[str, str]:
+    """Owner/writer/reader passwords for one database; missing ones are generated, existing kept."""
+    path = CREDENTIALS / f"{database}.secret"
+    values = read_env(path)
+    changed = False
+    for kind in ROLES:
+        key = f"{kind.upper()}_PASSWORD"
+        if not values.get(key):
+            values[key] = password()
+            changed = True
+    if changed:
+        write_private(
+            path,
+            [f"# Passwords for {database}. Source of truth; the .env files are generated."]
+            + [f"{k}={v}" for k, v in values.items()],
+        )
+    return values
+
+
+def write_app_env(database: str, passwords: dict[str, str]) -> None:
+    """The two files apps load: runtime (writer + reader) and migrations (owner)."""
+
+    def url(kind: str) -> str:
+        return (
+            f"postgresql+psycopg://{role(database, kind)}:{passwords[kind.upper() + '_PASSWORD']}"
+            f"@{CONTAINER}:5432/{database}"
+        )
+
+    write_private(
+        CREDENTIALS / f"{database}.env",
+        [
+            f"# {database}: runtime credentials (generated by bin/ensure-db). Keep private.",
+            "# Read/write for the app; read-only for tools. Host is the Docker network name;",
+            "# outside Docker use 127.0.0.1:5433 after `make local`.",
+            f"DATABASE_URL={url('writer')}",
+            f"READ_DATABASE_URL={url('reader')}",
+        ],
+    )
+    write_private(
+        CREDENTIALS / f"{database}.migrate.env",
+        [
+            f"# {database}: schema owner, for migrations only (generated by bin/ensure-db).",
+            f"MIGRATION_DATABASE_URL={url('owner')}",
+        ],
+    )
+
+
+# ---------------------------------------------------------------- server
+
+
+def health(cmd: list[str]) -> str:
+    result = subprocess.run(
+        cmd + ["inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{end}}", CONTAINER],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "missing"
+
+
+def ensure_server(cmd: list[str]) -> None:
+    """Start the shared container unless it is already running and healthy."""
+    admin_env()
+    if health(cmd) == "healthy":
+        return
+    say("starting the shared PostgreSQL container")
+    # Run from the repo so Compose reads .env and, locally, compose.override.yaml.
+    run(cmd + ["compose", "up", "-d", "--wait", "--wait-timeout", "180"], cwd=ROOT)
+    for _ in range(60):
+        if health(cmd) == "healthy":
+            break
+        time.sleep(2)
+    else:
+        fail("the container did not become healthy; see `docker logs shared-postgres`")
+    # No app role needs the maintenance database.
+    sql(cmd, "REVOKE CONNECT ON DATABASE postgres FROM PUBLIC;")
+
+
+def sql(cmd: list[str], statements: str, database: str = "postgres", user: str = ADMIN) -> str:
+    """Run SQL from stdin over the container's local socket."""
+    result = run(
+        cmd
+        + ["exec", "-i", CONTAINER, "psql", "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1"]
+        + ["-U", user, "-d", database],
+        input=statements,
+        capture_output=True,
+    )
+    return result.stdout.strip()
+
+
+def database_exists(cmd: list[str], database: str) -> bool:
+    return sql(cmd, f"SELECT 1 FROM pg_database WHERE datname = '{database}';") == "1"
+
+
+# ---------------------------------------------------------------- per-app setup
+
+
+def ensure_roles(cmd: list[str], database: str, passwords: dict[str, str]) -> None:
+    create = "\n".join(
+        f"  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role(database, k)}') "
+        f"THEN CREATE ROLE {role(database, k)}; END IF;"
+        for k in ROLES
+    )
+    alter = "\n".join(
+        f"ALTER ROLE {role(database, k)} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
+        f"NOREPLICATION NOBYPASSRLS PASSWORD '{passwords[k.upper() + '_PASSWORD']}';"
+        for k in ROLES
+    )
+    sql(cmd, f"DO $$\nBEGIN\n{create}\nEND\n$$;\n{alter}\n")
+
+
+def ensure_grants(cmd: list[str], database: str) -> None:
+    owner, writer, reader = (role(database, k) for k in ROLES)
+    sql(
+        cmd,
+        f"""
+ALTER DATABASE {database} OWNER TO {owner};
+REVOKE ALL ON DATABASE {database} FROM PUBLIC;
+GRANT CONNECT, TEMPORARY ON DATABASE {database} TO {writer}, {reader};
+""",
+    )
+    sql(
+        cmd,
+        f"""
+ALTER SCHEMA public OWNER TO {owner};
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO {writer}, {reader};
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {writer};
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO {reader};
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO {writer};
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO {reader};
+ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {writer};
+ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public GRANT SELECT ON TABLES TO {reader};
+ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO {writer};
+ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public GRANT SELECT ON SEQUENCES TO {reader};
+""",
+        database=database,
+    )
+
+
+def ensure_database(database: str, init_sql: Path | None = None) -> None:
+    """Idempotent: server, roles, database, grants and credentials files for one app."""
+    check_name(database)
+    if init_sql is not None and not init_sql.is_file():
+        fail(f"--init-sql file not found: {init_sql}")
+    cmd = docker()
+    with locked():
+        ensure_server(cmd)
+        passwords = app_passwords(database)
+        ensure_roles(cmd, database, passwords)
+        created = not database_exists(cmd, database)
+        if created:
+            sql(cmd, f"CREATE DATABASE {database} OWNER {role(database, 'owner')};")
+        ensure_grants(cmd, database)
+        if created and init_sql is not None:
+            say(f"loading {init_sql.name} into {database} as {role(database, 'owner')}")
+            sql(cmd, init_sql.read_text(), database=database, user=role(database, "owner"))
+        write_app_env(database, passwords)
+    say(
+        f"{database}: {'created' if created else 'ready'} "
+        f"(roles {', '.join(role(database, k) for k in ROLES)}; "
+        f"credentials in credentials/{database}.env and {database}.migrate.env)"
+    )
+
+
+def import_dump(database: str, dump: Path) -> None:
+    """Restore a pg_dump -Fc file into an empty app database, owned by the app's owner role."""
+    check_name(database)
+    if not dump.is_file():
+        fail(f"dump not found: {dump}")
+    ensure_database(database)
+    cmd = docker()
+    tables = sql(
+        cmd,
+        "SELECT count(*) FROM pg_tables WHERE schemaname = 'public';",
+        database=database,
+    )
+    if tables != "0":
+        fail(f"{database} already has {tables} tables; import only into an empty database")
+    say(f"restoring {dump.name} into {database}")
+    with locked(), dump.open("rb") as stream:
+        subprocess.run(
+            cmd
+            + ["exec", "-i", CONTAINER, "pg_restore", "--no-owner", "--no-privileges"]
+            + ["--exit-on-error", f"--role={role(database, 'owner')}", "-U", ADMIN, "-d", database],
+            stdin=stream,
+            check=True,
+        )
+        ensure_grants(cmd, database)
+        # pg_restore leaves the planner without statistics; until autovacuum catches up,
+        # queries on large tables can pick very slow plans. Analyze before apps connect.
+        say(f"{database}: analyzing tables")
+        sql(cmd, "ANALYZE;", database=database)
+    say(f"{database}: restored, analyzed and granted")
+
+
+def app_databases(cmd: list[str]) -> list[str]:
+    rows = sql(
+        cmd,
+        "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' "
+        "ORDER BY 1;",
+    )
+    return [row for row in rows.splitlines() if row]
+
+
+def backup(target: Path, keep_days: int) -> None:
+    cmd = docker()
+    if health(cmd) != "healthy":
+        fail("the shared container is not running")
+    stamp = time.strftime("%Y-%m-%dT%H%M%S")
+    for database in app_databases(cmd):
+        folder = target / database
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = folder / f"{stamp}.dump"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            subprocess.run(
+                cmd + ["exec", CONTAINER, "pg_dump", "-Fc", "-U", ADMIN, database],
+                stdout=stream,
+                check=True,
+            )
+        say(f"{database}: {path} ({path.stat().st_size // 1024} KiB)")
+        cutoff = time.time() - keep_days * 86400
+        for old in folder.glob("*.dump"):
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+
+
+def main_guard(function) -> None:
+    try:
+        function()
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or "").strip() if isinstance(error.stderr, str) else ""
+        # psql quotes the failing line, which may hold a generated password.
+        detail = re.sub(r"[0-9a-f]{48}", "<redacted>", detail)
+        sys.exit(f"postgres-platform: command failed ({error.returncode}). {detail}")

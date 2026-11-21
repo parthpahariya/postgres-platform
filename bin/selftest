@@ -1,0 +1,83 @@
+#!/usr/bin/env python3.13
+"""Check the role model end to end on two throwaway databases, then remove them.
+
+    bin/selftest
+
+Proves: ensure-db is idempotent (passwords kept), the reader can only read, the writer can
+read and change rows but not tables, the owner can change tables, tables the owner creates
+later are visible to writer and reader, and no role can connect to another app's database.
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import platform_lib as lib  # noqa: E402
+
+A, B = "pf_selftest_a", "pf_selftest_b"
+failures = []
+
+
+def as_role(cmd, database, kind, statement, connect_to=None):
+    """Run one statement over TCP with password auth, as <database>_<kind>."""
+    passwords = lib.read_env(lib.CREDENTIALS / f"{database}.secret")
+    # Throwaway roles: their password may appear in this process's arguments.
+    result = subprocess.run(
+        cmd + ["exec", "-i", "-e", f"PGPASSWORD={passwords[kind.upper() + '_PASSWORD']}"]
+        + [lib.CONTAINER, "psql", "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1"]
+        + ["-h", "127.0.0.1", "-U", lib.role(database, kind), "-d", connect_to or database],
+        input=statement, text=True, capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def expect(label, ok, should):
+    mark = "ok  " if ok == should else "FAIL"
+    if ok != should:
+        failures.append(label)
+    print(f"  [{mark}] {label}: {'allowed' if ok else 'refused'}")
+
+
+def main():
+    cmd = lib.docker()
+    try:
+        lib.ensure_database(A)
+        before = (lib.CREDENTIALS / f"{A}.secret").read_text()
+        lib.ensure_database(A)
+        expect("second ensure-db keeps passwords",
+               (lib.CREDENTIALS / f"{A}.secret").read_text() == before, True)
+        lib.ensure_database(B)
+        expect("owner creates a table",
+               as_role(cmd, A, "owner", "CREATE TABLE t (id serial PRIMARY KEY, v text);"), True)
+        expect("writer inserts", as_role(cmd, A, "writer", "INSERT INTO t (v) VALUES ('x');"), True)
+        expect("writer updates", as_role(cmd, A, "writer", "UPDATE t SET v = 'y';"), True)
+        expect("writer deletes", as_role(cmd, A, "writer", "DELETE FROM t;"), True)
+        expect("writer creates a table", as_role(cmd, A, "writer", "CREATE TABLE u (id int);"), False)
+        expect("writer drops a table", as_role(cmd, A, "writer", "DROP TABLE t;"), False)
+        expect("reader selects", as_role(cmd, A, "reader", "SELECT count(*) FROM t;"), True)
+        expect("reader inserts", as_role(cmd, A, "reader", "INSERT INTO t (v) VALUES ('z');"), False)
+        expect("owner adds a later table",
+               as_role(cmd, A, "owner", "CREATE TABLE later (id int); INSERT INTO later VALUES (1);"),
+               True)
+        expect("reader sees the later table",
+               as_role(cmd, A, "reader", "SELECT * FROM later;"), True)
+        expect("writer changes the later table",
+               as_role(cmd, A, "writer", "UPDATE later SET id = 2;"), True)
+        expect("A's writer connects to B", as_role(cmd, A, "writer", "SELECT 1;", connect_to=B), False)
+        expect("A's owner connects to B", as_role(cmd, A, "owner", "SELECT 1;", connect_to=B), False)
+        expect("A's reader connects to postgres",
+               as_role(cmd, A, "reader", "SELECT 1;", connect_to="postgres"), False)
+    finally:
+        for database in (A, B):
+            lib.sql(cmd, f"DROP DATABASE IF EXISTS {database} WITH (FORCE);")
+            lib.sql(cmd, "".join(f"DROP ROLE IF EXISTS {lib.role(database, k)};" for k in lib.ROLES))
+            for suffix in (".secret", ".env", ".migrate.env"):
+                (lib.CREDENTIALS / f"{database}{suffix}").unlink(missing_ok=True)
+        print("  cleaned up the self-test databases and roles")
+    if failures:
+        sys.exit(f"selftest FAILED: {', '.join(failures)}")
+    print("selftest passed")
+
+
+lib.main_guard(main)
