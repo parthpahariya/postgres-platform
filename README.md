@@ -89,3 +89,4 @@ On the VM, run backups daily from cron:
 On a Mac with several Colima profiles, each profile is a separate Docker daemon. Apps share
 this container only when they run on the same daemon. Run them in one profile to share it;
 otherwise each daemon gets its own `shared-postgres`.
+The workspace apps' Makefiles all use the `default` Colima profile for this reason.
