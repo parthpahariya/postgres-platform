@@ -65,6 +65,15 @@ def docker() -> list[str]:
     return []
 
 
+def compose_env() -> dict[str, str]:
+    """Environment for this repo's `docker compose`, without the calling app's COMPOSE_* settings.
+
+    Apps export variables such as COMPOSE_ENV_FILES or COMPOSE_FILE for their own project; inherited
+    here they would point Compose at files relative to postgres-platform that do not exist.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("COMPOSE_")}
+
+
 def run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(args, check=True, text=True, **kwargs)
 
@@ -185,8 +194,9 @@ def ensure_server(cmd: list[str]) -> None:
     if health(cmd) == "healthy":
         return
     say("starting the shared PostgreSQL container")
-    # Run from the repo so Compose reads .env and, locally, compose.override.yaml.
-    run(cmd + ["compose", "up", "-d", "--wait", "--wait-timeout", "180"], cwd=ROOT)
+    # Run from the repo so Compose reads .env and, locally, compose.override.yaml; drop the
+    # caller's COMPOSE_* variables so they cannot redirect this project.
+    run(cmd + ["compose", "up", "-d", "--wait", "--wait-timeout", "180"], cwd=ROOT, env=compose_env())
     for _ in range(60):
         if health(cmd) == "healthy":
             break
