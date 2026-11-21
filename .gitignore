@@ -1,0 +1,5 @@
+.env
+credentials/
+compose.override.yaml
+__pycache__/
+*.pyc
