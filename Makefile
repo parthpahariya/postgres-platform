@@ -10,7 +10,7 @@ COLIMA_CPUS ?= 4
 COLIMA_CONTEXT = $(if $(filter default,$(COLIMA_PROFILE)),colima,colima-$(COLIMA_PROFILE))
 COLIMA_START = $(COLIMA) start --profile "$(COLIMA_PROFILE)" --memory "$(COLIMA_MEMORY)" --cpus "$(COLIMA_CPUS)"
 
-.PHONY: up local ensure psql backup selftest status down check-colima colima_up vm_running colima_down vm_resize
+.PHONY: up local ensure psql backup selftest status down check-colima colima_up colima_running colima_down colima_resize
 
 up: ## Start the shared container (does nothing if it is already running)
 	bin/ensure-db --server-only
@@ -52,13 +52,13 @@ colima_up: check-colima ## Start the shared Colima VM if it is stopped (never re
 	@$(COLIMA) status --profile "$(COLIMA_PROFILE)" > /dev/null 2>&1 || $(COLIMA_START)
 	@docker context use $(COLIMA_CONTEXT) > /dev/null
 
-vm_running: check-colima ## Exit 0 if the shared Colima VM is running (for the apps' full_down)
+colima_running: check-colima ## Exit 0 if the shared Colima VM is running (for the apps' full_down)
 	@$(COLIMA) status --profile "$(COLIMA_PROFILE)" > /dev/null 2>&1
 
 colima_down: check-colima ## Stop the whole Colima VM: every app and shared-postgres. Data is kept.
 	$(COLIMA) stop --profile "$(COLIMA_PROFILE)"
 
-vm_resize: check-colima ## Restart the VM with COLIMA_MEMORY / COLIMA_CPUS (stops every app in it)
+colima_resize: check-colima ## Restart the VM with COLIMA_MEMORY / COLIMA_CPUS (stops every app in it)
 	$(COLIMA) stop --profile "$(COLIMA_PROFILE)"
 	$(COLIMA_START)
 	docker context use $(COLIMA_CONTEXT)

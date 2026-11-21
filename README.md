@@ -72,7 +72,7 @@ Git or CI, and are only readable by you (mode 600).
 | `make down` | Stop the container. The data volume `postgres-platform_data` is kept. |
 | `make colima_up` | Mac: start the shared Colima VM if it is stopped, and make it the Docker context |
 | `make colima_down` | Mac: stop the whole Colima VM (every app and this container). Data is kept. |
-| `make vm_resize` | Mac: restart the VM to apply `COLIMA_MEMORY` / `COLIMA_CPUS` (default 8 GiB / 4 CPUs) |
+| `make colima_resize` | Mac: restart the VM to apply `COLIMA_MEMORY` / `COLIMA_CPUS` (default 8 GiB / 4 CPUs) |
 
 On the VM, run backups daily from cron:
 
@@ -92,7 +92,7 @@ On the VM, run backups daily from cron:
 On a Mac with several Colima profiles, each profile is a separate Docker daemon. Apps share
 this container only when they run on the same daemon. Run them in one profile to share it;
 otherwise each daemon gets its own `shared-postgres`.
-This repo owns that VM: `make colima_up`, `colima_down` and `vm_resize` start, stop and resize the
+This repo owns that VM: `make colima_up`, `colima_down` and `colima_resize` start, stop and resize the
 `default` profile (override with `COLIMA_PROFILE`). The apps' `make full_up` calls `colima_up`
 here, which never restarts a running VM; stopping or resizing it is done only from this repo,
 because it affects every app.
